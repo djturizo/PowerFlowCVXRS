@@ -1,11 +1,20 @@
-using JuMP, MosekTools
+using JuMP, MathOptInterface
 using SparseArrays, LinearAlgebra, Plots
 using PowerModels, Ipopt
 
-#OPT_version="Gurobi"
-OPT_version="Mosek"
+using Infiltrator
+Infiltrator.toggle_async_check(false)
+# Infiltrator.clear_disabled!()
 
-const GRB_ENV = Gurobi.Env()
+# OPT_version="Gurobi"
+# OPT_version="Mosek"
+OPT_version="Ipopt"
+if OPT_version == "Gurobi"
+    using Gurobi
+    const GRB_ENV = Gurobi.Env()
+elseif OPT_version == "Mosek"
+    using MosekTools
+end
 
 function makeYbus(network_data,phase_shift=false)
     num_bus=length(network_data["bus"])
@@ -156,7 +165,7 @@ function test_runpf(network_data)
 
     network_data_test=deepcopy(network_data)
     [gen["pg"]=gen["pg"]+gen["ptc_factor"]*network_data_test["delta"] for (i,gen) in network_data_test["gen"]]
-    result_test=run_pf(network_data_test, ACPPowerModel, with_optimizer(Ipopt.Optimizer,print_level=0))
+    result_test=run_pf(network_data_test, ACPPowerModel, optimizer_with_attributes(Ipopt.Optimizer, "print_level" => 0))
     vm_test=zeros(Float64, num_bus); [vm_test[bus["idx"]]=result_test["solution"]["bus"][i]["vm"] for (i,bus) in network_data_test["bus"]]
     va_test=zeros(Float64, num_bus); [va_test[bus["idx"]]=result_test["solution"]["bus"][i]["va"] for (i,bus) in network_data_test["bus"]]
 
@@ -243,7 +252,7 @@ function opf_initialization(network_data, restriction_level)
 
     if restriction_level=="uniform"
         [gen["cost"]=[1.,0.] for (i,gen) in network_data_opf["gen"]]
-        [gen["ncose"]=2 for (i,gen) in network_data_opf["gen"]]
+        [gen["ncost"]=2 for (i,gen) in network_data_opf["gen"]]
         restriction_level=0
     end
 
@@ -269,11 +278,11 @@ function opf_initialization(network_data, restriction_level)
 
     if restriction_level==-1
         [gen["cost"]=[1.,0.] for (i,gen) in network_data_opf["gen"]]
-        [gen["ncose"]=2 for (i,gen) in network_data_opf["gen"]]
+        [gen["ncost"]=2 for (i,gen) in network_data_opf["gen"]]
     end
 
-    result_opf=run_opf(network_data_opf, ACPPowerModel, with_optimizer(Ipopt.Optimizer,print_level=0))
-    if (result_opf["termination_status"]!=JuMP.MathOptInterface.OPTIMAL) && (result_opf["termination_status"]!=JuMP.MathOptInterface.LOCALLY_SOLVED)
+    result_opf=run_opf(network_data_opf, ACPPowerModel, optimizer_with_attributes(Ipopt.Optimizer, "print_level" => 0))
+    if (result_opf["termination_status"]!=MathOptInterface.OPTIMAL) && (result_opf["termination_status"]!=MathOptInterface.LOCALLY_SOLVED)
         @error string("OPF Initialization failed. (",result_opf["termination_status"],")")
     end
     PowerModels.update_data!(network_data, result_opf["solution"])
@@ -420,9 +429,11 @@ function cvxrs(network_data,option,target_network_data=nothing,phase_shift=false
     M_line_minus=min.(M_line,zeros(size(M_line))).*(M_line.<-tol1);
 
     if OPT_version=="Gurobi"
-        m_cvx = Model(with_optimizer(Gurobi.Optimizer,GRB_ENV,OutputFlag=0))
+        # m_cvx = Model(optimizer_with_attributes(Gurobi.Optimizer,GRB_ENV,OutputFlag=0))
     elseif OPT_version=="Mosek"
-        m_cvx = Model(with_optimizer(Mosek.Optimizer,LOG=0))
+        # m_cvx = Model(optimizer_with_attributes(Mosek.Optimizer,LOG=0))
+    elseif OPT_version == "Ipopt"
+        m_cvx = Model(optimizer_with_attributes(Ipopt.Optimizer, "print_level" => 0))
     end
 
     @variable(m_cvx, vmin[i]<=vᵘ[i=1:num_bus]<=vmax[i], start=v0[i])
@@ -695,7 +706,7 @@ function cvxrs(network_data,option,target_network_data=nothing,phase_shift=false
     sanity_check["solve_time"]=solve_time(m_cvx)
     sanity_check["status"]=termination_status(m_cvx)
 
-    if termination_status(m_cvx)!=JuMP.MathOptInterface.OPTIMAL; @warn string("CVXRS was not optimal. (", termination_status(m_cvx),")"); end
+    if termination_status(m_cvx)!=MathOptInterface.OPTIMAL; @warn string("CVXRS was not optimal. (", termination_status(m_cvx),")"); end
     return network_data, sanity_check
 end
 
@@ -815,11 +826,20 @@ function scrs(network_data, max_iter_SCRS,phase_shift=false)
     result_cvxr=Dict("pg"=>zeros(num_gen,max_iter_SCRS+1),"vg"=>zeros(num_gen,max_iter_SCRS+1),"alpha"=>zeros(num_gen,max_iter_SCRS+1),
         "obj"=> zeros(max_iter_SCRS+1),"worst_cost"=> zeros(max_iter_SCRS+1),"solver_time"=>zeros(max_iter_SCRS+1),"issue"=>0,"max_iter"=>max_iter_SCRS)
 
+    # Corrected generation cost computation
+    gencost=zeros(Float64,num_gen,3); [gencost[gen["index"],4-size(gen["cost"],1):end]=gen["gen_status"]*gen["cost"] for (i,gen) in network_data["gen"]]
+    pg0=zeros(Float64, num_gen); [pg0[gen["index"]]=gen["gen_status"].*gen["pg"] for (i,gen) in network_data["gen"]]
+    delta=0
+    alpha=zeros(Float64, num_gen); [alpha[gen["index"]]=gen["ptc_factor"] for (i,gen) in network_data["gen"]]
+    network_data["cost"]=gencost[:,1]'*(pg0+alpha.*delta).^2+gencost[:,2]'*(pg0+alpha.*delta)+sum(gencost[:,3])
+    #--------------------------------------------------------------------------------------------------------------------------------------------------------
+
     result_cvxr["obj"][1]=network_data["cost"]
     [result_cvxr["pg"][gen["index"],1]=gen["gen_status"].*gen["pg"] for (i,gen) in network_data["gen"]]
     [result_cvxr["vg"][gen["index"],1]=gen["vg"] for (i,gen) in network_data["gen"]]
     [result_cvxr["alpha"][gen["index"],1]=gen["ptc_factor"] for (i,gen) in network_data["gen"]]
 
+    # @infiltrate #TODO: Delete
     for iter=2:result_cvxr["max_iter"]+1
         network_data,sanity_check=cvxrs(network_data,"obj",nothing,phase_shift)
         network_data=runpf(network_data)
@@ -876,7 +896,7 @@ function sample_pf(network_data,num_data,bounded=0)
         [network_data_run["load"][i]["qd"]=ql_sampled[load["index"],idx_data] for (i,load) in network_data_run["load"]]
 
         network_data_run=runpf(network_data_run)
-        #network_data_run=run_pf(network_data_run, ACPPowerModel, with_optimizer(Ipopt.Optimizer,print_level=0))
+        #network_data_run=run_pf(network_data_run, ACPPowerModel, optimizer_with_attributes(Ipopt.Optimizer, "print_level" => 0))
 
         #test_runpf(network_data_run)
         violation_status, margin_all[idx_data]=check_violation(network_data_run,1)
